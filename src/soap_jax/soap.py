@@ -1,13 +1,13 @@
 from itertools import chain
-from typing import Callable, Iterable, NamedTuple, Optional, Union
+from typing import Callable, Iterable, NamedTuple, Optional, Union, cast
 
-import chex
 import jax
 import jax.numpy as jnp
 import jax.tree_util as jtu
 import optax
 import optax.tree_utils as otu
 from chex import Numeric
+from jax.typing import ArrayLike, DTypeLike
 from jaxtyping import Array
 from optax import GradientTransformation, Updates
 
@@ -36,10 +36,10 @@ class Preconditioner:
 
 class SOAPState(NamedTuple):
     count: Array
-    exp_avg: Updates
-    exp_avg_sq: Updates
-    GG: Updates  # Pytree of Preconditioner
-    Q: Updates  # Pytree of Preconditioners
+    exp_avg: tuple[Array, ...]
+    exp_avg_sq: tuple[Array, ...]
+    GG: tuple[Preconditioner, ...]
+    Q: tuple[Preconditioner, ...]
 
 
 class PostDecayState(NamedTuple):
@@ -58,8 +58,8 @@ def soap(
     max_precond_dim: int = 10000,
     precondition_1d: bool = False,
     precision: jax.lax.PrecisionLike = jax.lax.Precision.HIGHEST,
-    mu_dtype: Optional[chex.ArrayDType] = None,
-    qr_dtype: Optional[chex.ArrayDType] = None,
+    mu_dtype: Optional[DTypeLike] = None,
+    qr_dtype: Optional[DTypeLike] = None,
 ) -> optax.GradientTransformationExtraArgs:
     """
     Implements SOAP algorithm (https://arxiv.org/abs/2409.11321). Based on the original implementation at https://github.com/nikhilvyas/SOAP.
@@ -79,9 +79,9 @@ def soap(
         precondition_1d (bool, optional): Whether to precondition 1D gradients. If False, 1D params use Adam-style
             updates. Defaults to False.
         precision (jax.lax.PrecisionLike, optional): Precision to use. Defaults to jax.lax.Precision.HIGHEST.
-        mu_dtype (chex.ArrayDType, optional): dtype for the first and second moment estimates (exp_avg and exp_avg_sq).
+        mu_dtype (DTypeLike, optional): dtype for the first and second moment estimates (exp_avg and exp_avg_sq).
             If None, uses the same dtype as the parameters. Useful for mixed-precision training. Defaults to None.
-        qr_dtype (chex.ArrayDType, optional): dtype used for eigen/QR computations and preconditioner storage.
+        qr_dtype (DTypeLike, optional): dtype used for eigen/QR computations and preconditioner storage.
             If None, follows each parameter's dtype. Defaults to None.
 
     Returns:
@@ -116,8 +116,8 @@ def scale_by_soap(
     max_precond_dim: int = 10000,
     precondition_1d: bool = False,
     precision: jax.lax.PrecisionLike = jax.lax.Precision.HIGHEST,
-    mu_dtype: Optional[chex.ArrayDType] = None,
-    qr_dtype: Optional[chex.ArrayDType] = None,
+    mu_dtype: Optional[DTypeLike] = None,
+    qr_dtype: Optional[DTypeLike] = None,
 ) -> GradientTransformation:
     """
     Implements SOAP algorithm (https://arxiv.org/abs/2409.11321). Based on the original implementation at https://github.com/nikhilvyas/SOAP.
@@ -135,9 +135,9 @@ def scale_by_soap(
         precondition_1d (bool, optional): Whether to precondition 1D gradients. If False, 1D params use Adam-style
             updates. Defaults to False.
         precision (jax.lax.PrecisionLike, optional): Precision to use. Defaults to jax.lax.Precision.HIGHEST.
-        mu_dtype (chex.ArrayDType, optional): dtype for the first and second moment estimates (exp_avg and exp_avg_sq).
+        mu_dtype (DTypeLike, optional): dtype for the first and second moment estimates (exp_avg and exp_avg_sq).
             If None, uses the same dtype as the parameters. Useful for mixed-precision training. Defaults to None.
-        qr_dtype (chex.ArrayDType, optional): dtype used for eigen/QR computations and preconditioner storage.
+        qr_dtype (DTypeLike, optional): dtype used for eigen/QR computations and preconditioner storage.
             If None, follows each parameter's dtype. Defaults to None.
 
     Returns:
@@ -181,9 +181,9 @@ def scale_by_soap(
         )
 
     def init_step(
-        updates: Updates,
+        updates: tuple[Array, ...],
         state: SOAPState,
-    ) -> tuple[Updates, SOAPState]:
+    ) -> tuple[tuple[Array, ...], SOAPState]:
         new_GG = jtu.tree_map(
             lambda grad, gg: update_preconditioner(grad, gg, shampoo_beta, precision),
             updates,
@@ -203,9 +203,9 @@ def scale_by_soap(
         return new_updates, state._replace(GG=new_GG, Q=new_Q)
 
     def update_step(
-        updates: Updates,
+        updates: tuple[Array, ...],
         state: SOAPState,
-    ) -> tuple[Updates, SOAPState]:
+    ) -> tuple[tuple[Array, ...], SOAPState]:
         # Project gradients
         grad_projected = jtu.tree_map(
             lambda grad, q: project(grad, q, precision),
@@ -252,7 +252,7 @@ def scale_by_soap(
         )
 
         # Update the orthogonal matrix / exp_avg_sq
-        def refresh_preconditioner() -> tuple[Updates, Updates, Updates]:
+        def refresh_preconditioner() -> tuple[tuple[Preconditioner, ...], tuple[Array, ...], tuple[Array, ...]]:
             new_Q_and_exp_avg_sq = jtu.tree_map(
                 lambda e, gg, q: get_orthogonal_matrix_QR(gg, q, e, precision, qr_dtype),
                 exp_avg_sq,
@@ -279,8 +279,8 @@ def scale_by_soap(
             )
             return new_Q, new_exp_avg_sq, new_exp_avg
 
-        def keep_preconditioner() -> tuple[Updates, Updates, Updates]:
-            return state.Q, exp_avg_sq, exp_avg
+        def keep_preconditioner() -> tuple[tuple[Preconditioner, ...], tuple[Array, ...], tuple[Array, ...]]:
+            return state.Q, cast(tuple[Array, ...], exp_avg_sq), cast(tuple[Array, ...], exp_avg)
 
         new_Q, exp_avg_sq, exp_avg = jax.lax.cond(
             (state.count - 1) % precondition_frequency == 0,
@@ -301,17 +301,17 @@ def scale_by_soap(
     def update_fn(updates: Updates, state: SOAPState, params: Optional[Updates] = None) -> tuple[Updates, SOAPState]:
         del params
         leaves, treedef = jtu.tree_flatten(updates)
-        updates = tuple(leaves)
+        flat_updates = tuple(leaves)
         count_inc = jnp.asarray(optax.safe_int32_increment(state.count))
         state = state._replace(count=count_inc)
 
-        updates, new_state = jax.lax.cond(
+        new_updates, new_state = jax.lax.cond(
             count_inc == 1,
-            lambda: init_step(updates, state),
-            lambda: update_step(updates, state),
+            lambda: init_step(flat_updates, state),
+            lambda: update_step(flat_updates, state),
         )
 
-        return jtu.tree_unflatten(treedef, updates), new_state
+        return jtu.tree_unflatten(treedef, new_updates), new_state
 
     return optax.GradientTransformation(init_fn, update_fn)  # type: ignore
 
@@ -340,7 +340,7 @@ def add_decayed_weights_post(
         updates = jtu.tree_map(lambda u, p: u - decay * p, updates, params)
         return updates, state._replace(count=count_inc)
 
-    return optax.GradientTransformation(init_fn, update_fn)  # ty:ignore[invalid-argument-type]
+    return optax.GradientTransformation(init_fn, cast(optax.TransformUpdateFn, update_fn))
 
 
 def update_preconditioner(
@@ -414,7 +414,7 @@ def project_back(
     return grad.astype(in_dtype)
 
 
-def get_orthogonal_matrix(gg: Union[Array, None], qr_dtype: Optional[chex.ArrayDType]) -> Union[Array, None]:
+def get_orthogonal_matrix(gg: Union[Array, None], qr_dtype: Optional[DTypeLike]) -> Union[Array, None]:
     if gg is None:
         return None
 
@@ -434,7 +434,7 @@ def get_orthogonal_matrix_QR(
     Q: Preconditioner,
     exp_avg_sq: Array,
     precision: jax.lax.PrecisionLike = jax.lax.Precision.HIGHEST,
-    qr_dtype: Optional[chex.ArrayDType] = None,
+    qr_dtype: Optional[DTypeLike] = None,
 ) -> tuple[Preconditioner, Array]:
     final_Q = []
     for ind, (m, o) in enumerate(zip(GG.matrices, Q.matrices)):
@@ -477,7 +477,7 @@ def init_conditioner(
     p: Array,
     max_precond_dim: int,
     precondition_1d: bool,
-    dtype: Optional[chex.ArrayDType],
+    dtype: Optional[DTypeLike],
 ) -> Preconditioner:
     if dtype is None:
         dtype = p.dtype
@@ -493,8 +493,8 @@ def _is_preconditioner(value: object) -> bool:
     return isinstance(value, Preconditioner)
 
 
-def _resolve_learning_rate(learning_rate: optax.ScalarOrSchedule, count: Array) -> Array:
+def _resolve_learning_rate(learning_rate: optax.ScalarOrSchedule, count: Array) -> ArrayLike:
     if callable(learning_rate):
-        return learning_rate(count)  # ty:ignore[invalid-return-type]
+        return learning_rate(count)
 
     return jnp.asarray(learning_rate)
